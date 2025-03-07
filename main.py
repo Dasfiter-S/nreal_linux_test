@@ -25,29 +25,65 @@ SWITCH_DELAY = 0.3  # Prevents excessive updates
 previous_yaw = 0
 last_update_time = time.time()
 
-# Ensure the FIFO (Named Pipe) Exists for Screen Capture
-if not os.path.exists(FIFO_PATH):
-    os.mkfifo(FIFO_PATH)
-
 # Detect Wayland compositor
-compositor = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+DESKTOP_ENV = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
 
 # Function to check if a command exists
 def command_exists(cmd):
     return shutil.which(cmd) is not None
 
-# Setup Virtual Displays
-def setup_virtual_displays():
-    logging.info("🖥️ Setting up virtual monitors...")
+# Function to get number of connected displays
+def get_connected_displays():
+    if DESKTOP_ENV == "kde":
+        output = subprocess.run(["kscreen-doctor"], capture_output=True, text=True).stdout
+        return output.count("connected")
+    else:
+        output = subprocess.run(["wlr-randr"], capture_output=True, text=True).stdout
+        return output.count("connected")
 
-    if not command_exists("wlr-randr"):
-        logging.error("❌ `wlr-randr` not found! Install it first.")
-        exit(1)
+# Function to add virtual screens dynamically
+def add_virtual_screens():
+    logging.info("🖥️ Adding virtual screens...")
+    connected_displays = get_connected_displays()
+    logging.info(f"Detected {connected_displays} connected displays.")
 
-    subprocess.run(["wlr-randr", "--output", "Virtual-1", "--mode", "1920x1080", "--pos", "1920,0"])
-    subprocess.run(["wlr-randr", "--output", "Virtual-2", "--mode", "1920x1080", "--pos", "3840,0"])
+    if connected_displays >= 3:
+        logging.info("⚠️ You already have 3 physical monitors. Virtual screens will be added without modifying them.")
 
-    logging.info("✅ Virtual monitors created.")
+    if DESKTOP_ENV == "kde":
+        if command_exists("kscreen-doctor"):
+            subprocess.run(["kscreen-doctor", "output.Virtual-1.position.5760,0"])
+            subprocess.run(["kscreen-doctor", "output.Virtual-2.position.7680,0"])
+        else:
+            logging.error("❌ kscreen-doctor not found! Ensure KDE Plasma has `kscreen-doctor` installed.")
+            exit(1)
+    else:
+        if command_exists("wlr-randr"):
+            subprocess.run(["wlr-randr", "--output", "Virtual-1", "--mode", "1920x1080", "--pos", "5760,0"])
+            subprocess.run(["wlr-randr", "--output", "Virtual-2", "--mode", "1920x1080", "--pos", "7680,0"])
+        else:
+            logging.error("❌ wlr-randr not found! Ensure you are using a wlroots-based compositor (Hyprland, Sway).")
+            exit(1)
+    logging.info("✅ Virtual screens added.")
+
+# Function to remove virtual screens when the script exits
+def remove_virtual_screens():
+    logging.info("🖥️ Removing virtual screens...")
+    if DESKTOP_ENV == "kde":
+        subprocess.run(["kscreen-doctor", "output.Virtual-1.disable"])
+        subprocess.run(["kscreen-doctor", "output.Virtual-2.disable"])
+    else:
+        subprocess.run(["wlr-randr", "--output", "Virtual-1", "--off"])
+        subprocess.run(["wlr-randr", "--output", "Virtual-2", "--off"])
+    logging.info("✅ Virtual screens removed.")
+
+# Ensure virtual screens are removed when the script exits
+import atexit
+atexit.register(remove_virtual_screens)
+
+# Ensure the FIFO (Named Pipe) Exists for Screen Capture
+if not os.path.exists(FIFO_PATH):
+    os.mkfifo(FIFO_PATH)
 
 # Start Screen Capture Using `wf-recorder`
 def start_screen_capture():
@@ -87,7 +123,7 @@ pygame.init()
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 
 # Setup Virtual Displays and Start Screen Capture
-setup_virtual_displays()
+add_virtual_screens()
 start_screen_capture()
 imu_process = start_imu_driver()
 
@@ -132,10 +168,8 @@ while True:
             if yaw is None:
                 continue
 
-            # Apply smoothing to avoid jitter
             yaw = previous_yaw * (1 - SMOOTHING_FACTOR) + yaw * SMOOTHING_FACTOR
 
-            # Debounce to prevent excessive updates
             if abs(yaw - previous_yaw) < YAW_THRESHOLD or time.time() - last_update_time < SWITCH_DELAY:
                 continue
 
@@ -143,34 +177,19 @@ while True:
             last_update_time = time.time()
 
             normed_yaw_angle = translate(yaw, left_yaw_value, right_yaw_value, -1, 1)
-            normed_yaw_angle = max(-1, min(1, normed_yaw_angle))  # Clamp values between -1 and 1
-
-            # Adjust screen slicing based on head movement
-            if normed_yaw_angle < 0:
-                img_left_mon = np.array(frame[:, :SCREEN_WIDTH, :])
-                img_center_mon = np.array(frame[:, SCREEN_WIDTH:, :])
-                sliced_img_left_mon = img_left_mon[:, int((1 - abs(normed_yaw_angle)) * SCREEN_WIDTH):, :]
-                sliced_img_center_mon = img_center_mon[:, :int((1 - abs(normed_yaw_angle)) * SCREEN_WIDTH), :]
-                img = np.concatenate((sliced_img_left_mon, sliced_img_center_mon), axis=1)
-            else:
-                img_right_mon = np.array(frame[:, :SCREEN_WIDTH, :])
-                img_center_mon = np.array(frame[:, SCREEN_WIDTH:, :])
-                sliced_img_right_mon = img_right_mon[:, :int(abs(normed_yaw_angle) * SCREEN_WIDTH), :]
-                sliced_img_center_mon = img_center_mon[:, int(abs(normed_yaw_angle) * SCREEN_WIDTH):, :]
-                img = np.concatenate((sliced_img_center_mon, sliced_img_right_mon), axis=1)
+            normed_yaw_angle = max(-1, min(1, normed_yaw_angle))
 
             # Convert NumPy Image to Pygame Surface
-            surface = pygame.surfarray.make_surface(img)
+            surface = pygame.surfarray.make_surface(frame)
 
             # Display in Nreal Glasses
             screen.blit(surface, (0, 0))
             pygame.display.update()
 
-            # Handle Quit Event
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
-                    subprocess.run(["pkill", "wf-recorder"])  # Stop screen capture
+                    subprocess.run(["pkill", "wf-recorder"])
                     exit(0)
 
         except Exception as e:
