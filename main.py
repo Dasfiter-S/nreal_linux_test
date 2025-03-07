@@ -1,235 +1,177 @@
-import cv2
 import subprocess
 import threading
 import collections
-import subprocess
 import time
 import numpy as np
+import os
+import logging
+import shutil
+import pygame  # SDL-based rendering for Wayland
+from PIL import Image
+import re
 
-command = "./nrealAirLinuxDriver"
+# Logging setup
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
-input_screens_width = 1920
-input_screens_height = 1080
-output_screen_width = 1920
-output_screen_height = 1080
-num_input_screens = 2
+# Constants
+IMU_PROCESS = "./nrealAirLinuxDriver"
+SCREEN_WIDTH = 1920
+SCREEN_HEIGHT = 1080
+NUM_INPUT_SCREENS = 2
+FIFO_PATH = "/tmp/screen_capture"
+SMOOTHING_FACTOR = 0.2  # Controls how smoothly the screen transitions
+YAW_THRESHOLD = 5  # Minimum yaw difference to update screen
+SWITCH_DELAY = 0.3  # Prevents excessive updates
+previous_yaw = 0
+last_update_time = time.time()
 
+# Ensure the FIFO (Named Pipe) Exists for Screen Capture
+if not os.path.exists(FIFO_PATH):
+    os.mkfifo(FIFO_PATH)
 
-initial_pitch_value = None
-initial_roll_value = None
-initial_yaw_value = None
+# Detect Wayland compositor
+compositor = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
 
+# Function to check if a command exists
+def command_exists(cmd):
+    return shutil.which(cmd) is not None
+
+# Setup Virtual Displays
+def setup_virtual_displays():
+    logging.info("🖥️ Setting up virtual monitors...")
+
+    if not command_exists("wlr-randr"):
+        logging.error("❌ `wlr-randr` not found! Install it first.")
+        exit(1)
+
+    subprocess.run(["wlr-randr", "--output", "Virtual-1", "--mode", "1920x1080", "--pos", "1920,0"])
+    subprocess.run(["wlr-randr", "--output", "Virtual-2", "--mode", "1920x1080", "--pos", "3840,0"])
+
+    logging.info("✅ Virtual monitors created.")
+
+# Start Screen Capture Using `wf-recorder`
+def start_screen_capture():
+    logging.info("Starting screen capture...")
+    subprocess.Popen(["wf-recorder", "-o", "HDMI-A-1", "-g", "1920x1080+0+0", "-f", FIFO_PATH])
+
+# Start Nreal Air Driver
+def start_imu_driver():
+    process = subprocess.Popen(
+        IMU_PROCESS,
+        stdout=subprocess.PIPE,
+        universal_newlines=True,
+        cwd="/home/nrealAirLinuxDriver/build/",
+    )
+    return process
+
+# Function to Read IMU Output
+q = collections.deque(maxlen=1)
 
 def read_output(process, append):
     for stdout_line in iter(process.stdout.readline, ""):
         append(stdout_line)
 
+# Function to parse IMU data
+def get_pitch_roll_yaw(input_str):
+    try:
+        match = re.search(r"Yaw:\s*(-?\d+\.\d+)", input_str)
+        if match:
+            yaw = float(match.group(1))
+            return yaw
+    except Exception as e:
+        logging.error(f"Error parsing IMU data: {e}")
+    return None
 
-process = subprocess.Popen(
-    command,
-    stdout=subprocess.PIPE,
-    universal_newlines=True,
-    cwd="/home/nrealAirLinuxDriver/build/",
-)
-number_of_lines = 1
-q = collections.deque(maxlen=number_of_lines)
-t = threading.Thread(target=read_output, args=(process, q.append))
+# Setup Pygame for Rendering
+pygame.init()
+screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+# Setup Virtual Displays and Start Screen Capture
+setup_virtual_displays()
+start_screen_capture()
+imu_process = start_imu_driver()
+
+t = threading.Thread(target=read_output, args=(imu_process, q.append))
 t.daemon = True
 t.start()
 
+# Calibration
+logging.info("Calibrating head position...")
+start_time = time.time()
+initial_yaw_value = None
 
-def get_pitch_roll_yaw(input_str):
-    pitch, roll, yaw = map(
-        float,
-        "".join(input_str)
-        .replace("Pitch:", "")
-        .replace("Roll:", "")
-        .replace("Yaw:", "")
-        .split(";"),
-    )
+while time.time() - start_time < 10:
+    if q:
+        initial_yaw_value = get_pitch_roll_yaw("".join(q))
+        if initial_yaw_value is not None:
+            logging.info(f"Initial yaw value: {initial_yaw_value:.2f}")
+            break
 
-    return (roll, pitch, yaw)
+# Define left and right boundaries based on user calibration
+left_yaw_value = float(input("Look at the leftmost screen and press enter: "))
+right_yaw_value = float(input("Look at the rightmost screen and press enter: "))
 
-
-cap = cv2.VideoCapture(
-    f"ximagesrc use_damage=1 endx={num_input_screens*input_screens_width-1} ! queue ! videoconvert ! video/x-raw, format=BGR ! appsink"
-)
-
-
-if not cap.isOpened():
-    print("Cannot capture from camera. Exiting.")
-    quit()
-
-start_time = time.time()  # start timer
-
-while True:
-    elapsed_time = time.time() - start_time  # get elapsed time
-    if elapsed_time >= 10:  # if elapsed time is greater than or equal to 10 seconds
-        initial_pitch_value, initial_roll_value, initial_yaw_value = get_pitch_roll_yaw(
-            q
-        )  # save pitch, roll, and yaw values
-        print(
-            "Initial values saved - Pitch: {:.2f}; Roll: {:.2f}; Yaw: {:.2f}".format(
-                initial_pitch_value, initial_roll_value, initial_yaw_value
-            )
-        )
-        break
-
-
-def get_monitor_pixels(pixels_array, input_screens_width, monitor_index):
-    num_monitors = pixels_array.shape[1] // input_screens_width
-    if monitor_index < 0 or monitor_index >= num_monitors:
-        raise ValueError(
-            f"Invalid monitor index: {monitor_index}. There are {num_monitors} monitors in the array."
-        )
-    start_col = monitor_index * input_screens_width
-    end_col = start_col + input_screens_width
-    return pixels_array[:, start_col:end_col, :]
-
-
-# translate from one range to another
+# Function to normalize yaw movement
 def translate(value, leftMin, leftMax, rightMin, rightMax):
-    # Figure out how 'wide' each range is
     leftSpan = leftMax - leftMin
     rightSpan = rightMax - rightMin
-
-    # Convert the left range into a 0-1 range (float)
     valueScaled = float(value - leftMin) / float(leftSpan)
-
-    # Convert the 0-1 range into a value in the right range.
     return rightMin + (valueScaled * rightSpan)
 
-
-user_input = input(
-    "Press enter once you are looking at your (imaginary) 'leftmost' screen"
-)
-left_yaw_value = get_pitch_roll_yaw(q)[2]
-user_input = input(
-    "Press enter once you are looking at your (imaginary) 'rightmost' screen"
-)
-right_yaw_value = get_pitch_roll_yaw(q)[2]
-# user_input = input(
-#     "Press enter once you are looking above your (imaginary) 'front' screen"
-# )
-# up_pitch_value = get_pitch_roll_yaw(q)[0]
-# user_input = input(
-#     "Press enter once you are looking below your (imaginary) 'front' screen"
-# )
-# down_pitch_value = get_pitch_roll_yaw(q)[0]
-
+# Main Loop
 while True:
-    ret, frame = cap.read()
+    with open(FIFO_PATH, "rb") as fifo:
+        raw_image = fifo.read()
 
-    if ret == False:
-        break
+    frame = np.array(Image.frombytes("RGB", (SCREEN_WIDTH * NUM_INPUT_SCREENS, SCREEN_HEIGHT), raw_image))
 
-    if "".join(q) is not None:
+    if q:
         try:
-            pitch, roll, yaw = get_pitch_roll_yaw(q)
-            # print("Pitch: {:.2f}; Roll: {:.2f}; Yaw: {:.2f}".format(pitch, roll, yaw))
+            yaw = get_pitch_roll_yaw("".join(q))
+
+            if yaw is None:
+                continue
+
+            # Apply smoothing to avoid jitter
+            yaw = previous_yaw * (1 - SMOOTHING_FACTOR) + yaw * SMOOTHING_FACTOR
+
+            # Debounce to prevent excessive updates
+            if abs(yaw - previous_yaw) < YAW_THRESHOLD or time.time() - last_update_time < SWITCH_DELAY:
+                continue
+
+            previous_yaw = yaw
+            last_update_time = time.time()
+
             normed_yaw_angle = translate(yaw, left_yaw_value, right_yaw_value, -1, 1)
-            if normed_yaw_angle > 1:
-                normed_yaw_angle = 1
-            if normed_yaw_angle < -1:
-                normed_yaw_angle = -1
+            normed_yaw_angle = max(-1, min(1, normed_yaw_angle))  # Clamp values between -1 and 1
 
-            # normed_pitch_angle = translate(
-            #     pitch, down_pitch_value, up_pitch_value, -1, 1
-            # )
-            # if normed_pitch_angle > 1:
-            #     normed_pitch_angle = 1
-            # if normed_pitch_angle < -1:
-            #     normed_pitch_angle = -1
-
-            # looking left case
+            # Adjust screen slicing based on head movement
             if normed_yaw_angle < 0:
-                img_left_mon = np.array(
-                    get_monitor_pixels(frame, input_screens_width, 0)
-                )
-                img_center_mon = np.array(
-                    get_monitor_pixels(frame, input_screens_width, 1)
-                )
-                sliced_img_left_mon = img_left_mon[
-                    :, int((1 - abs(normed_yaw_angle)) * input_screens_width) :, :
-                ]
-                sliced_img_center_mon = img_center_mon[
-                    :, 0 : int((1 - abs(normed_yaw_angle)) * input_screens_width), :
-                ]
+                img_left_mon = np.array(frame[:, :SCREEN_WIDTH, :])
+                img_center_mon = np.array(frame[:, SCREEN_WIDTH:, :])
+                sliced_img_left_mon = img_left_mon[:, int((1 - abs(normed_yaw_angle)) * SCREEN_WIDTH):, :]
+                sliced_img_center_mon = img_center_mon[:, :int((1 - abs(normed_yaw_angle)) * SCREEN_WIDTH), :]
+                img = np.concatenate((sliced_img_left_mon, sliced_img_center_mon), axis=1)
+            else:
+                img_right_mon = np.array(frame[:, :SCREEN_WIDTH, :])
+                img_center_mon = np.array(frame[:, SCREEN_WIDTH:, :])
+                sliced_img_right_mon = img_right_mon[:, :int(abs(normed_yaw_angle) * SCREEN_WIDTH), :]
+                sliced_img_center_mon = img_center_mon[:, int(abs(normed_yaw_angle) * SCREEN_WIDTH):, :]
+                img = np.concatenate((sliced_img_center_mon, sliced_img_right_mon), axis=1)
 
-                img = np.concatenate(
-                    (sliced_img_left_mon, sliced_img_center_mon), axis=1
-                )
+            # Convert NumPy Image to Pygame Surface
+            surface = pygame.surfarray.make_surface(img)
 
-            # looking right case
-            if normed_yaw_angle >= 0:
-                img_right_mon = np.array(
-                    get_monitor_pixels(frame, input_screens_width, 0)
-                )
-                img_center_mon = np.array(
-                    get_monitor_pixels(frame, input_screens_width, 1)
-                )
-                sliced_img_right_mon = img_right_mon[
-                    :, 0 : int(abs(normed_yaw_angle) * input_screens_width), :
-                ]
-                sliced_img_center_mon = img_center_mon[
-                    :, int(abs(normed_yaw_angle) * input_screens_width) :, :
-                ]
+            # Display in Nreal Glasses
+            screen.blit(surface, (0, 0))
+            pygame.display.update()
 
-                img = np.concatenate(
-                    (sliced_img_center_mon, sliced_img_right_mon), axis=1
-                )
-
-            # # looking up case
-            # print(pitch)
-            # if normed_pitch_angle > 0:
-            #     # shift image down, replacing by black
-            #     showing_screen = img[
-            #         0 : int((1 - abs(normed_pitch_angle)) * input_screens_height), :, :
-            #     ]
-            #     showing_black = np.zeros(
-            #         (
-            #             input_screens_height
-            #             - int((1 - abs(normed_pitch_angle)) * input_screens_height),
-            #             input_screens_width,
-            #             3,
-            #         ),
-            #         dtype=np.uint8,
-            #     )
-            #     showing_black[:, :, 2] = 0
-            #     img = np.concatenate((showing_black, showing_screen), axis=0)
-
-            # # looking down case
-            # if normed_pitch_angle <= 0:
-            #     # shift image up, replacing by black
-            #     showing_screen = img[
-            #         int(abs(normed_pitch_angle) * input_screens_height) :, :, :
-            #     ]
-            #     showing_black = np.zeros(
-            #         (
-            #             int(abs(normed_pitch_angle) * input_screens_height),
-            #             input_screens_width,
-            #             3,
-            #         ),
-            #         dtype=np.uint8,
-            #     )
-            #     showing_black[:, :, 2] = 0
-            #     img = np.concatenate((showing_screen, showing_black), axis=0)
-
-            capname = "cap"
-            cv2.namedWindow(capname, cv2.WND_PROP_FULLSCREEN)
-            cv2.setWindowProperty(
-                capname, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
-            )
-            cv2.imshow(capname, img)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-            cv2.moveWindow(capname, input_screens_width * num_input_screens, 0)
+            # Handle Quit Event
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    subprocess.run(["pkill", "wf-recorder"])  # Stop screen capture
+                    exit(0)
 
         except Exception as e:
-            print(f"Couldn't parse imu values {e}")
-
-    # cv2.imshow("FrameREAD", frame)
-
-
-cap.release()
-cv2.destroyAllWindows()
+            logging.error(f"Couldn't parse IMU values: {e}")
