@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e  # Stop script on error
+set -e  # Exit on errors
 
 # Logging function
 log() {
@@ -44,7 +44,7 @@ fi
 DESKTOP_ENV=$(echo "$XDG_CURRENT_DESKTOP" | tr '[:upper:]' '[:lower:]')
 
 if [[ "$DESKTOP_ENV" == "gnome" || "$DESKTOP_ENV" == "xfce" || "$DESKTOP_ENV" == "lxqt" ]]; then
-    error "Your desktop environment ($DESKTOP_ENV) does not support wlr-randr or wf-recorder. Exiting."
+    error "Your desktop environment ($DESKTOP_ENV) does not support virtual screens. Exiting."
 fi
 
 log "✅ Compatible Wayland desktop environment detected: $DESKTOP_ENV"
@@ -58,7 +58,7 @@ is_installed() {
     fi
 }
 
-# Install system dependencies
+# Install system dependencies (only if missing)
 log "Installing system dependencies..."
 DEPENDENCIES=("git" "cmake" "make" "gcc" "g++" "libusb-1.0-0-dev" "libjson-c-dev" "python3" "python3-pip" "python3-venv")
 for package in "${DEPENDENCIES[@]}"; do
@@ -70,9 +70,15 @@ for package in "${DEPENDENCIES[@]}"; do
     fi
 done
 
-# Install Wayland tools
-log "Installing Wayland tools (wlr-randr, wf-recorder)..."
-WAYLAND_TOOLS=("wlr-randr" "wf-recorder" "qt5-tools")
+# Install the correct display tool based on desktop environment
+if [[ "$DESKTOP_ENV" == "kde" ]]; then
+    DISPLAY_TOOL="kscreen-doctor"
+else
+    DISPLAY_TOOL="wlr-randr"
+fi
+
+log "Installing display tools ($DISPLAY_TOOL, wf-recorder)..."
+WAYLAND_TOOLS=("wf-recorder" "qt5-tools" "$DISPLAY_TOOL")
 
 for tool in "${WAYLAND_TOOLS[@]}"; do
     if ! is_installed "$tool"; then
@@ -82,17 +88,6 @@ for tool in "${WAYLAND_TOOLS[@]}"; do
         log "✅ $tool is already installed. Skipping."
     fi
 done
-
-# Ensure required Wayland tools are installed
-if ! command -v wlr-randr &>/dev/null; then
-    error "wlr-randr is missing! Make sure you are using a wlroots-based Wayland compositor (Hyprland, Sway, etc.)."
-fi
-
-if ! command -v wf-recorder &>/dev/null; then
-    error "wf-recorder is missing! This is required for screen capture. Exiting."
-fi
-
-log "✅ Required Wayland tools installed."
 
 # Set up a Python Virtual Environment (venv)
 log "Setting up a Python virtual environment..."
@@ -105,21 +100,11 @@ else
     log "✅ Virtual environment created at $VENV_DIR"
 fi
 
-# Activate venv and install Python dependencies
 source "$VENV_DIR/bin/activate"
-log "Installing Python libraries inside venv..."
-PYTHON_PACKAGES=("numpy" "pillow" "pygame")
+pip install --upgrade pip
+pip install numpy pillow pygame
 
-for package in "${PYTHON_PACKAGES[@]}"; do
-    if ! pip show "$package" &>/dev/null; then
-        log "Installing $package..."
-        pip install "$package"
-    else
-        log "✅ $package is already installed in venv. Skipping."
-    fi
-done
-
-log "✅ Python dependencies installed inside the virtual environment."
+log "✅ Python dependencies installed."
 
 # Clone and build the Nreal Air Linux Driver
 log "Cloning Nreal Air Linux Driver..."
@@ -133,9 +118,10 @@ else
 fi
 
 log "Building the driver..."
-mkdir -p build && cd build
+mkdir -p build
+cd build
 cmake ..
-make -j$(nproc)
+make -j"$(nproc)"
 sudo make install
 
 # Set up USB permissions
@@ -151,7 +137,8 @@ ID_PRODUCT=$(echo $DEVICE_ID | awk '{print $2}')
 
 echo "SUBSYSTEM==\"usb\", ATTR{idVendor}==\"$ID_VENDOR\", ATTR{idProduct}==\"$ID_PRODUCT\", MODE=\"0666\"" | sudo tee /etc/udev/rules.d/99-nreal.rules
 
-sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 
 log "✅ USB permissions set. Replug your Nreal glasses."
 
